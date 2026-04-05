@@ -12,11 +12,13 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script>
 window.MathJax = {
+  loader: { load: ['[tex]/noerrors'] },
   tex: { 
     inlineMath: [['$','$']], displayMath: [['$$','$$']], 
     processEscapes: true,
     processEnvironments: false,
-    processRefs: false
+    processRefs: false,
+    packages: {'[+]': ['noerrors']}
   },
   options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] },
   startup: { typeset: false }
@@ -84,7 +86,7 @@ window.MathJax = {
 .input-wrapper.drag-over{border-color:var(--accent);box-shadow:0 0 0 3px var(--glow)}
 
 html{height:100%;height:-webkit-fill-available}
-body{height:100vh;height:100dvh;background:var(--bg);color:var(--text);font-family:'Noto Sans SC',sans-serif;font-weight:300;overflow:hidden;display:flex;flex-direction:column}
+body{height:100vh;height:100dvh;background:var(--bg);color:var(--text);font-family:'Noto Sans SC',sans-serif;font-weight:300;overflow:hidden;display:flex;flex-direction:column;overscroll-behavior:none}
 body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:0.4;pointer-events:none;z-index:0}
 #app{position:relative;z-index:1;display:flex;flex-direction:column;height:100%;width:100%;max-width:860px;margin:0 auto}
 header{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:7px;flex-wrap:wrap;background:rgba(10,10,15,0.95);backdrop-filter:blur(12px);flex-shrink:0}
@@ -278,6 +280,7 @@ select option{background:#1a1528;color:var(--text)}
       <button class="persona-btn active" data-persona="default">🤖 助手</button>
       <button class="persona-btn"        data-persona="neko">🐱 猫娘</button>
     </div>
+    <button class="hdr-btn" id="think-btn" title="开启后模型会进行深度推理（较慢）">💭 思考:关</button>
     <button class="hdr-btn" id="clear-btn">清空</button>
     <button class="hdr-btn" id="export-btn" title="导出会话为 Markdown">↓ MD</button>
     <button class="hdr-btn" id="theme-btn">🌙 深色</button>
@@ -317,7 +320,7 @@ select option{background:#1a1528;color:var(--text)}
         </button>
       </div>
     </div>
-    <div class="hint">Enter 发送 · Shift+Enter 换行<span class="hint-desktop"> · 🖼 左键相册 · 📎 右键文件/相机 · 支持拖拽粘贴</span></div>
+    <div class="hint">Enter 发送 · Shift+Enter 换行</div>
   </div>
 </div>
 <script>
@@ -580,6 +583,18 @@ document.addEventListener('visibilitychange',()=>{
   else if(musicOn){bgAudio.play().catch(()=>{});}
 });
 
+// ── Think mode toggle ──────────────────────
+const thinkBtn=document.getElementById('think-btn');
+let thinkMode=localStorage.getItem('thinkMode')==='true';
+function applyThinkMode(){
+  thinkBtn.textContent=thinkMode?'💭 思考:开':'💭 思考:关';
+  thinkBtn.style.borderColor=thinkMode?'var(--accent)':'';
+  thinkBtn.style.color=thinkMode?'var(--accent2)':'';
+  localStorage.setItem('thinkMode',thinkMode);
+}
+thinkBtn.addEventListener('click',()=>{thinkMode=!thinkMode;applyThinkMode();});
+applyThinkMode();
+
 // ── Smart scroll ───────────────────────────
 function isNearBottom(){return messagesEl.scrollHeight-messagesEl.scrollTop-messagesEl.clientHeight<80;}
 function scrollIfNeeded(){if(isNearBottom())messagesEl.scrollTop=messagesEl.scrollHeight;}
@@ -720,6 +735,31 @@ function renderMessages(){
   scrollToBottom();
 }
 
+// ── Image compression ──────────────────────
+// 上传前压缩图片：最长边限制 1200px，质量 0.82，大幅减小 base64 体积
+function compressImage(file, maxPx=1200, quality=0.82){
+  return new Promise(resolve=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{
+      URL.revokeObjectURL(url);
+      const {naturalWidth:w,naturalHeight:h}=img;
+      let tw=w,th=h;
+      if(w>maxPx||h>maxPx){
+        if(w>=h){tw=maxPx;th=Math.round(h*maxPx/w);}
+        else{th=maxPx;tw=Math.round(w*maxPx/h);}
+      }
+      const canvas=document.createElement('canvas');
+      canvas.width=tw;canvas.height=th;
+      canvas.getContext('2d').drawImage(img,0,0,tw,th);
+      const mime=file.type==='image/png'?'image/png':'image/jpeg';
+      resolve(canvas.toDataURL(mime,mime==='image/png'?undefined:quality));
+    };
+    img.onerror=()=>{URL.revokeObjectURL(url);resolve(null);};
+    img.src=url;
+  });
+}
+
 // ── File helpers ───────────────────────────
 function readAsDataUrl(f){return new Promise(res=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.readAsDataURL(f);});}
 function readAsText(f){return new Promise(res=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.onerror=()=>res(null);r.readAsText(f);});}
@@ -760,7 +800,14 @@ function addFileThumb(name,size,icon,idx){
 async function addAnyFile(file){
   const isImage=file.type.startsWith('image/');
   if(isImage){
-    const dataUrl=await readAsDataUrl(file);
+    // 超过 4MB 才压缩，小图直接原图发（截图/文字图不损失质量）
+    const COMPRESS_THRESHOLD=1*1024*1024; // 超过 1MB 就压
+    let dataUrl;
+    if(file.size>COMPRESS_THRESHOLD){
+      dataUrl=(await compressImage(file,800,0.75))||await readAsDataUrl(file);
+    }else{
+      dataUrl=await readAsDataUrl(file);
+    }
     pendingFiles.push({type:'image',base64:dataUrl.split(',')[1],mimeType:file.type,dataUrl,name:file.name,size:file.size});
     addImageThumb(dataUrl,pendingFiles.length-1);
   } else {
@@ -1142,7 +1189,7 @@ async function callAPI(model){
       payloadMessages=[...sysMsgs,...recentMsgs];
     }
     const res=await fetch('/api/chat',{method:'POST',headers:API_HEADERS,
-      body:JSON.stringify({model,messages:payloadMessages,stream:true}),
+      body:JSON.stringify({model,messages:payloadMessages,stream:true,think:thinkMode}),
       signal:abortController.signal});
     if(!res.ok)throw new Error(`HTTP ${res.status}`);
     const reader=res.body.getReader();const decoder=new TextDecoder();
